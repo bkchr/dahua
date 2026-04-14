@@ -23,6 +23,7 @@ from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 
 from . import dahua_utils
 from .client import DahuaClient
+from .rpc2 import DahuaRpc2Client
 
 from .const import (
     CONF_EVENTS,
@@ -100,8 +101,9 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         connector = TCPConnector(enable_cleanup_closed=True, ssl=SSL_CONTEXT)
         self._session = ClientSession(connector=connector)
 
-        # The client used to communicate with Dahua devices
-        self.client: DahuaClient = DahuaClient(username, password, address, port, rtsp_port, self._session)
+        # The client used to communicate with Dahua devices (CGI or RPC2, determined during init)
+        self.client = DahuaClient(username, password, address, port, rtsp_port, self._session)
+        self._client_args = (username, password, address, port, rtsp_port, self._session)
 
         self.config_entry = entry
         self.platforms = []
@@ -265,6 +267,35 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                 self.machine_name = data.get("table.General.MachineName")
                 self._serial_number = data.get("serialNumber")
 
+                # RPC2 fallback: newer VTO firmware only supports RPC2, not CGI
+                if device_type is None or device_type == "Generic RTSP":
+                    try:
+                        _LOGGER.info("CGI API unavailable, trying RPC2 API")
+                        rpc2_client = DahuaRpc2Client(*self._client_args)
+                        await rpc2_client.login()
+
+                        rpc2_dt = await rpc2_client.get_device_type()
+                        rpc2_device_type = rpc2_dt.get("type")
+                        if rpc2_device_type and rpc2_device_type != "Generic RTSP":
+                            data["model"] = rpc2_device_type
+                            self.model = rpc2_device_type
+                            _LOGGER.info("RPC2 detected device type: %s", rpc2_device_type)
+
+                            rpc2_name = await rpc2_client.get_device_name()
+                            if rpc2_name:
+                                data["table.General.MachineName"] = rpc2_name
+                                self.machine_name = rpc2_name
+
+                            rpc2_serial = await rpc2_client.get_serial_number()
+                            if rpc2_serial:
+                                data["serialNumber"] = rpc2_serial
+                                self._serial_number = rpc2_serial
+
+                            self.client = rpc2_client
+                            _LOGGER.info("Switched to RPC2 client for all API calls")
+                    except Exception as ex:
+                        _LOGGER.debug("RPC2 fallback failed for %s: %s", self._address, ex)
+
                 try:
                     await self.client.async_get_snapshot(0)
                     # If able to take a snapshot with index 0 then most likely this cams channel needs to be reset
@@ -278,21 +309,21 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                 try:
                     await self.client.async_get_coaxial_control_io_status()
                     self._supports_coaxial_control = True
-                except ClientResponseError:
+                except Exception:
                     self._supports_coaxial_control = False
                 _LOGGER.info("Device supports Coaxial Control=%s", self._supports_coaxial_control)
 
                 try:
                     await self.client.async_get_disarming_linkage()
                     self._supports_disarming_linkage = True
-                except ClientError:
+                except Exception:
                     self._supports_disarming_linkage = False
                 _LOGGER.info("Device supports disarming linkage=%s", self._supports_disarming_linkage)
 
                 try:
                     await self.client.async_get_event_notifications()
                     self._supports_event_notifications = True
-                except ClientError:
+                except Exception:
                     self._supports_event_notifications = False
                 _LOGGER.info("Device supports event notifications=%s", self._supports_event_notifications)
 
@@ -301,7 +332,7 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                 try:
                     await self.client.async_get_ptz_position()
                     self._supports_ptz_position = True
-                except ClientError:
+                except Exception:
                     self._supports_ptz_position = False
                 _LOGGER.info("Device supports PTZ position=%s", self._supports_ptz_position)
 
@@ -310,7 +341,7 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                 try:
                     await self.client.async_get_smart_motion_detection()
                     self._supports_smart_motion_detection = True
-                except ClientError:
+                except Exception:
                     self._supports_smart_motion_detection = False
                 _LOGGER.info("Device supports smart motion detection=%s", self._supports_smart_motion_detection)
 
@@ -325,18 +356,15 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                 try:
                     await self.client.async_get_config_lighting(self._channel, self._profile_mode)
                     self._supports_lighting = True
-                except ClientError:
+                except Exception:
                     self._supports_lighting = False
-                    pass
                 _LOGGER.info("Device supports infrared lighting=%s", self.supports_infrared_light())
 
-#Checking lighting_v2 support
                 try:
                     await self.client.async_get_lighting_v2()
                     self._supports_lighting_v2 = True
-                except ClientError:
+                except Exception:
                     self._supports_lighting_v2 = False
-                    pass
                 _LOGGER.info("Device supports Lighting_V2=%s", self._supports_lighting_v2)
 
 
@@ -351,7 +379,7 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                         # Error: Error -1 getting param in name=Lighting[0][1]
                         # Otherwise we'll get multiple lines of config back
                         self._supports_profile_mode = len(conf) > 1
-                    except ClientError:
+                    except Exception:
                         _LOGGER.info("Cam does not support profile mode. Will use mode 0")
                         self._supports_profile_mode = False
                     _LOGGER.info("Device supports profile mode=%s", self._supports_profile_mode)
