@@ -157,7 +157,7 @@ class DahuaVTOClient(asyncio.Protocol):
         if not self.disconnected.done():
             self.disconnected.set_result(True)
 
-    def send(self, action, handler, params=None):
+    def send(self, action, handler, params=None, object_id=None):
         if params is None:
             params = {}
 
@@ -170,6 +170,9 @@ class DahuaVTOClient(asyncio.Protocol):
             "method": action,
             "params": params
         }
+
+        if object_id is not None:
+            message_data["object"] = object_id
 
         self.data_handlers[self.request_id] = handler
 
@@ -302,10 +305,21 @@ class DahuaVTOClient(asyncio.Protocol):
     async def cancel_call(self):
         _LOGGER.info("Cancelling call on VTO")
 
-        def cancel(message):
-            _LOGGER.info(f"Got cancel call response: {message}")
+        def handle_instance(message):
+            if message is None:
+                return
+            phone_obj = message.get("result")
+            if phone_obj:
+                def handle_end(msg):
+                    _LOGGER.info(f"Got endCall response: {msg}")
+                self.send("VideoTalkPhone.endCall", handle_end, object_id=phone_obj)
+            else:
+                _LOGGER.info("VideoTalkPhone not available, falling back to console.runCmd hc")
+                def handle_hc(msg):
+                    _LOGGER.info(f"Got console hc response: {msg}")
+                self.send("console.runCmd", handle_hc, {"command": "hc"})
 
-        self.send("console.runCmd", cancel, {"command": "hc"})
+        self.send("VideoTalkPhone.factory.instance", handle_instance)
         return True
 
     def load_version(self):
